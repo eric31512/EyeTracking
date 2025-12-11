@@ -18,10 +18,10 @@ class Config:
     
     # Smoothing parameters
     # EMA (Exponential Moving Average) alpha: lower = smoother but more lag
-    EMA_ALPHA = 0.3
+    EMA_ALPHA = 0.15  # Reduced from 0.3 for more stability
     
     # Moving average window size for additional smoothing
-    SMOOTHING_WINDOW = 5
+    SMOOTHING_WINDOW = 10  # Increased from 5 for more stability
     
     # Blink detection parameters
     # Eye Aspect Ratio threshold - below this is considered a blink

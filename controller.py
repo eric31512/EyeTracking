@@ -13,10 +13,11 @@ from landmarks import (
     calculate_ear, get_iris_position
 )
 from utils import Smoother, CalibrationData
+from head_pose import HeadPoseEstimator
 
 
 # Disable PyAutoGUI fail-safe for smoother control (move mouse to corner to exit)
-pyautogui.FAILSAFE = True
+pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0  # Remove delay between PyAutoGUI calls
 
 
@@ -47,6 +48,9 @@ class EyeMouseController:
         # State management
         self.calibration = CalibrationData()
         self.smoother = Smoother(Config.EMA_ALPHA, Config.SMOOTHING_WINDOW)
+        
+        # Head pose estimator for gaze normalization
+        self.head_pose = HeadPoseEstimator(Config.CAMERA_WIDTH, Config.CAMERA_HEIGHT)
         
         # Blink detection state
         self.blink_counter = 0  # Counts consecutive frames with eyes closed
@@ -111,6 +115,7 @@ class EyeMouseController:
         Process frame during calibration phase.
         
         Displays instructions and visualizes detected face/iris.
+        Uses 5-point calibration: 4 corners + center.
         Does NOT move the mouse.
         """
         height, width = frame.shape[:2]
@@ -120,21 +125,15 @@ class EyeMouseController:
         cv2.rectangle(overlay, (0, 0), (width, 100), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
         
+        # Get current calibration target
+        total_points = len(CalibrationData.CALIBRATION_POINTS)
+        current_step = self.calibration.calibration_step
+        step_name = self.calibration.get_current_step_name()
+        
         # Draw calibration instructions
-        if self.calibration.calibration_step == 0:
-            text1 = "CALIBRATION: Step 1/2"
-            text2 = "Look at the TOP-LEFT corner of your screen"
-            text3 = "Press 'C' to capture"
-            corner_pos = (50, 150)
-            cv2.circle(frame, corner_pos, 20, Config.COLOR_GREEN, -1)
-            cv2.circle(frame, corner_pos, 25, Config.COLOR_GREEN, 2)
-        else:
-            text1 = "CALIBRATION: Step 2/2"
-            text2 = "Look at the BOTTOM-RIGHT corner of your screen"
-            text3 = "Press 'C' to capture"
-            corner_pos = (width - 50, height - 50)
-            cv2.circle(frame, corner_pos, 20, Config.COLOR_GREEN, -1)
-            cv2.circle(frame, corner_pos, 25, Config.COLOR_GREEN, 2)
+        text1 = f"CALIBRATION: Step {current_step + 1}/{total_points}"
+        text2 = f"Look at the {step_name.upper()} target"
+        text3 = "Press 'C' to capture"
         
         # Draw text
         cv2.putText(frame, text1, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 
@@ -144,22 +143,35 @@ class EyeMouseController:
         cv2.putText(frame, text3, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 
                     0.6, Config.COLOR_CYAN, 1)
         
-        # Draw detected iris position if face is detected
+        # Draw current calibration target on frame
+        target = self.calibration.get_current_target(Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT)
+        if target:
+            # Scale target position to frame size for visualization
+            frame_x = int(target[0] / Config.SCREEN_WIDTH * width)
+            frame_y = int(target[1] / Config.SCREEN_HEIGHT * height)
+            
+            # Draw pulsing target circle
+            cv2.circle(frame, (frame_x, frame_y), 25, Config.COLOR_GREEN, -1)
+            cv2.circle(frame, (frame_x, frame_y), 30, Config.COLOR_GREEN, 2)
+            cv2.circle(frame, (frame_x, frame_y), 35, Config.COLOR_WHITE, 1)
+        
         if results.multi_face_landmarks:
             landmarks = results.multi_face_landmarks[0].landmark
-            iris_pos = get_iris_position(landmarks)
+            iris_data = get_iris_position(landmarks)
             
-            if iris_pos:
-                # Convert to pixel coordinates for visualization
-                iris_x = int(iris_pos[0] * width)
-                iris_y = int(iris_pos[1] * height)
+            if iris_data:
+                rel_pos, abs_pos = iris_data
+                
+                # Convert to pixel coordinates for visualization using absolute position
+                iris_x = int(abs_pos[0] * width)
+                iris_y = int(abs_pos[1] * height)
                 
                 # Draw iris indicator
                 cv2.circle(frame, (iris_x, iris_y), 10, Config.COLOR_RED, -1)
                 cv2.circle(frame, (iris_x, iris_y), 15, Config.COLOR_RED, 2)
                 
-                # Show raw coordinates
-                coord_text = f"Iris: ({iris_pos[0]:.3f}, {iris_pos[1]:.3f})"
+                # Show relative ratios for debugging
+                coord_text = f"Eye: ({rel_pos[0]:.3f}, {rel_pos[1]:.3f})"
                 cv2.putText(frame, coord_text, (width - 250, height - 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, Config.COLOR_GREEN, 1)
         else:
@@ -174,6 +186,7 @@ class EyeMouseController:
         Process frame during active control phase.
         
         Moves the mouse based on gaze and detects blinks for clicking.
+        Uses head pose disentanglement for accurate tracking during head movement.
         """
         height, width = frame.shape[:2]
         
@@ -190,11 +203,37 @@ class EyeMouseController:
         if results.multi_face_landmarks:
             landmarks = results.multi_face_landmarks[0].landmark
             
-            # Get iris position
-            iris_pos = get_iris_position(landmarks)
+            # FIRST: Check if user is blinking (before moving mouse)
+            is_blinking = self._check_is_blinking(landmarks)
             
-            if iris_pos:
-                raw_x, raw_y = iris_pos
+            # Estimate head pose
+            pose_result = self.head_pose.estimate_pose(landmarks)
+            euler_angles = None
+            if pose_result:
+                rvec, tvec, euler_angles = pose_result
+                pitch, yaw, roll = euler_angles
+                
+                # Display head pose
+                pose_text = f"Head: P:{pitch:.0f} Y:{yaw:.0f} R:{roll:.0f}"
+                cv2.putText(frame, pose_text, (20, height - 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, Config.COLOR_CYAN, 1)
+                
+                # Draw pose axes for visualization
+                self.head_pose.draw_pose_axes(frame, rvec, tvec, length=50)
+            
+            # Get iris position
+            iris_data = get_iris_position(landmarks)
+            
+            if iris_data:
+                rel_pos, abs_pos = iris_data
+                raw_x, raw_y = rel_pos
+                
+                # Apply head pose normalization if available
+                if euler_angles is not None:
+                    normalized_x, normalized_y = self.head_pose.normalize_gaze(
+                        rel_pos, landmarks, euler_angles
+                    )
+                    raw_x, raw_y = normalized_x, normalized_y
                 
                 # Map to screen coordinates using calibration
                 screen_x, screen_y = self.calibration.map_to_screen(
@@ -210,24 +249,30 @@ class EyeMouseController:
                     smooth_x = max(0, min(Config.SCREEN_WIDTH - 1, smooth_x))
                     smooth_y = max(0, min(Config.SCREEN_HEIGHT - 1, smooth_y))
                     
-                    # Move mouse
-                    pyautogui.moveTo(int(smooth_x), int(smooth_y))
-                    
-                    # Store for visualization
-                    self.current_gaze = (int(smooth_x), int(smooth_y))
+                    # ONLY move mouse if NOT blinking
+                    # This prevents cursor jumping when eyes close
+                    if not is_blinking:
+                        pyautogui.moveTo(int(smooth_x), int(smooth_y))
+                        # Store for visualization
+                        self.current_gaze = (int(smooth_x), int(smooth_y))
                     
                     # Draw gaze point on frame (scaled to frame size)
                     gaze_frame_x = int(smooth_x / Config.SCREEN_WIDTH * width)
                     gaze_frame_y = int(smooth_y / Config.SCREEN_HEIGHT * height)
-                    cv2.circle(frame, (gaze_frame_x, gaze_frame_y), 15, Config.COLOR_GREEN, -1)
-                    cv2.circle(frame, (gaze_frame_x, gaze_frame_y), 20, Config.COLOR_GREEN, 2)
+                    
+                    # Use different color when blinking (yellow) vs normal (green)
+                    gaze_color = Config.COLOR_YELLOW if is_blinking else Config.COLOR_GREEN
+                    cv2.circle(frame, (gaze_frame_x, gaze_frame_y), 15, gaze_color, -1)
+                    cv2.circle(frame, (gaze_frame_x, gaze_frame_y), 20, gaze_color, 2)
                     
                     # Show coordinates
                     pos_text = f"Screen: ({int(smooth_x)}, {int(smooth_y)})"
-                    cv2.putText(frame, pos_text, (width - 200, height - 20),
+                    if is_blinking:
+                        pos_text += " [FROZEN]"
+                    cv2.putText(frame, pos_text, (width - 250, height - 20),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, Config.COLOR_GREEN, 1)
             
-            # Blink detection
+            # Blink detection for clicking
             self._detect_blink(landmarks, frame)
         else:
             cv2.putText(frame, "Face lost - please center yourself", 
@@ -235,6 +280,19 @@ class EyeMouseController:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, Config.COLOR_RED, 2)
         
         return frame
+    
+    def _check_is_blinking(self, landmarks):
+        """
+        Check if user is currently blinking (eyes closed).
+        
+        Returns:
+            bool: True if eyes are closed (blinking), False otherwise
+        """
+        left_ear = calculate_ear(landmarks, LEFT_EYE_LANDMARKS)
+        right_ear = calculate_ear(landmarks, RIGHT_EYE_LANDMARKS)
+        avg_ear = (left_ear + right_ear) / 2
+        return avg_ear < Config.EAR_THRESHOLD
+    
     
     def _detect_blink(self, landmarks, frame):
         """
@@ -324,16 +382,21 @@ class EyeMouseController:
             return
         
         landmarks = results.multi_face_landmarks[0].landmark
-        iris_pos = get_iris_position(landmarks)
+        iris_data = get_iris_position(landmarks)
         
-        if iris_pos is None:
+        if iris_data is None:
             print("[Warning] Iris not detected - cannot capture calibration point")
             return
+            
+        rel_pos, _ = iris_data
         
-        if self.calibration.calibration_step == 0:
-            self.calibration.set_top_left(iris_pos[0], iris_pos[1])
-        elif self.calibration.calibration_step == 1:
-            self.calibration.set_bottom_right(iris_pos[0], iris_pos[1])
+        # Add calibration point using new 5-point system
+        completed = self.calibration.add_calibration_point(
+            rel_pos[0], rel_pos[1],
+            Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT
+        )
+        
+        if completed:
             print("\n[Info] Calibration complete! Entering control mode...\n")
     
     def cleanup(self):
